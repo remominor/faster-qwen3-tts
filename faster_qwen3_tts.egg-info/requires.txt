@@ -1,0 +1,11 @@
+qwen-tts>=0.1.1
+transformers>=4.57
+torch>=2.5.1
+numpy
+soundfile
+huggingface-hub
+
+[server]
+fastapi>=0.100.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.7

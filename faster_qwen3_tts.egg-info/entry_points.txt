@@ -1,0 +1,2 @@
+[console_scripts]
+faster-qwen3-tts = faster_qwen3_tts.cli:main
