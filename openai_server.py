@@ -62,6 +62,7 @@ import soundfile as sf
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -73,6 +74,23 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="faster-qwen3-tts OpenAI-compatible API")
+
+# Browser clients (including the Gradio UI) send an OPTIONS preflight before
+# cross-origin JSON, PATCH, DELETE, and multipart requests. Starlette's CORS
+# middleware answers those preflights with the required 2xx response and CORS
+# headers before request routing reaches the API handlers.
+_cors_origins = [
+    origin.strip()
+    for origin in os.environ.get("TTS_CORS_ALLOW_ORIGINS", "*").split(",")
+    if origin.strip()
+] or ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 tts_model = None
 voices: dict = {}
@@ -319,6 +337,13 @@ class SpeechRequest(BaseModel):
     voice_url: Optional[str] = None
     chunk_size: Optional[int] = None
     instructions: Optional[str] = None
+
+
+class VoiceUpdate(BaseModel):
+    """Editable metadata for an uploaded voice."""
+
+    name: Optional[str] = None
+    ref_text: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -718,21 +743,137 @@ async def list_voices():
     }
 
 
+def _uploaded_voice_path_or_404(voice_id: str) -> Path:
+    """Resolve an uploaded voice, rejecting configured read-only voices."""
+    if voice_id in voices:
+        raise HTTPException(status_code=403, detail="Configured voices cannot be modified")
+    candidate = resolve_voice_file(voice_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail=f"Uploaded voice {voice_id!r} not found")
+    return candidate
+
+
+def _voice_response_for_path(path: Path) -> dict:
+    meta = _read_voice_meta(path.with_suffix(".json"))
+    stem = path.stem
+    name = meta.get("name") or stem
+    return {
+        "id": name,
+        "voice_id": stem,
+        "name": name,
+        "object": "voice",
+        "owned_by": "faster-qwen3-tts",
+        "filename": path.name,
+        "ref_text": meta.get("ref_text", ""),
+        "embedding": path.suffix.lower() == _EMBEDDING_EXTENSION,
+    }
+
+
+@app.patch("/v1/audio/voices/{voice_id}")
+async def update_voice(voice_id: str, update: VoiceUpdate):
+    """Update the name and/or reference transcript of an uploaded voice."""
+    candidate = _uploaded_voice_path_or_404(voice_id)
+    meta_path = candidate.with_suffix(".json")
+    meta = _read_voice_meta(meta_path)
+
+    if "name" in update.model_fields_set:
+        new_name = (update.name or "").strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Voice name cannot be empty")
+        if new_name in voices:
+            raise HTTPException(status_code=409, detail="Voice name conflicts with a configured voice")
+        for item in list_uploaded_voices():
+            if item["voice_id"] != candidate.stem and item["name"] == new_name:
+                raise HTTPException(status_code=409, detail="Voice name is already in use")
+        meta["name"] = new_name
+
+    if "ref_text" in update.model_fields_set:
+        ref_text = (update.ref_text or "").strip()
+        if ref_text:
+            meta["ref_text"] = ref_text
+        else:
+            meta.pop("ref_text", None)
+
+    if meta:
+        with open(meta_path, "w") as jf:
+            json.dump(meta, jf)
+    elif meta_path.exists():
+        meta_path.unlink()
+
+    return _voice_response_for_path(candidate)
+
+
+@app.get("/v1/audio/voices/{voice_id}")
+async def get_voice(voice_id: str):
+    """Return one configured or uploaded voice."""
+    if voice_id in voices:
+        config = voices[voice_id]
+        return {
+            "id": voice_id,
+            "voice_id": voice_id,
+            "name": voice_id,
+            "object": "voice",
+            "owned_by": "faster-qwen3-tts",
+            "filename": Path(config.get("spk_embedding", config.get("ref_audio", ""))).name,
+            "ref_text": config.get("ref_text", ""),
+            "embedding": "spk_embedding" in config,
+        }
+    candidate = _uploaded_voice_path_or_404(voice_id)
+    return _voice_response_for_path(candidate)
+
+
+@app.delete("/v1/audio/voices/{voice_id}")
+async def delete_voice(voice_id: str):
+    """Delete an uploaded voice and all files generated for it."""
+    candidate = _uploaded_voice_path_or_404(voice_id)
+    stem = candidate.stem
+    removed = []
+    for path in VOICE_STORAGE_DIR.iterdir():
+        if path.is_file() and path.stem == stem and path.suffix.lower() in (
+            _VOICE_FILE_EXTENSIONS | {_EMBEDDING_EXTENSION, ".json"}
+        ):
+            path.unlink()
+            removed.append(path.name)
+
+    if tts_model is not None:
+        for cache_key in list(tts_model._voice_prompt_cache):
+            if isinstance(cache_key, tuple) and cache_key and str(cache_key[0]) in {
+                str(candidate), str(candidate.with_suffix(".pt")), str(candidate.with_suffix(".wav"))
+            }:
+                tts_model._voice_prompt_cache.pop(cache_key, None)
+
+    return {"deleted": True, "voice_id": stem, "files": removed}
+
+
 @app.post("/upload_voice")
 async def upload_voice(
     voice_file: UploadFile = File(None),
     voice_url: str = Form(None),
     name: str = Form(None),
+    voice_name: str = Form(None),
     ref_text: str = Form(None),
     reference_text: str = Form(None),
+    data: str = Form(None),
 ):
     """Upload a voice sample → normalise to 24 kHz mono WAV → store locally → return voice_id."""
     ensure_voice_storage()
+
+    # Support metadata provided as a JSON string in the 'data' field
+    meta_from_data = {}
+    if data:
+        try:
+            meta_from_data = json.loads(data)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse 'data' form field as JSON: %r", data)
+
     if voice_url is None and voice_file is None:
         raise HTTPException(status_code=400, detail="voice_url or voice_file is required")
 
-    final_ref_text = (ref_text or reference_text or "").strip()
-    final_name = (name or "").strip()
+    final_ref_text = (ref_text or reference_text or meta_from_data.get("ref_text") or "").strip()
+    # ``name`` is the canonical API field. Accept the older/client-specific
+    # ``voice_name`` field as a compatibility fallback so uploads retain the
+    # supplied display name instead of falling back to the UUID filename.
+    final_name = (name or voice_name or meta_from_data.get("name") or "").strip()
     source_path = None
     download_tmp = None
     dest_path = None
