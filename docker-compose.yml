@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: faster-qwen3-tts-openai
+    image: ghcr.io/remominor/faster-qwen3-tts:latest
     ports:
       - "8000:8000"
     volumes:

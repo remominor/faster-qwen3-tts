@@ -10,6 +10,24 @@ Requires: Python 3.10+, PyTorch 2.5.1+, NVIDIA GPU with CUDA.
 pip install faster-qwen3-tts
 ```
 
+## Docker / GHCR
+
+The OpenAI-compatible server image is published at
+`ghcr.io/remominor/faster-qwen3-tts:latest` and requires an NVIDIA GPU with
+the NVIDIA Container Toolkit:
+
+```bash
+docker pull ghcr.io/remominor/faster-qwen3-tts:latest
+docker run --rm --gpus all -p 8000:8000 \
+  -v "$PWD/voices:/app/voices" \
+  -v "$PWD/hf_cache:/tmp/.cache/huggingface" \
+  ghcr.io/remominor/faster-qwen3-tts:latest
+```
+
+Set `QWEN_TTS_MODEL` or other server options through the container environment
+and command arguments. Pushes to `main` publish `latest`; version tags also
+publish version and commit-SHA tags.
+
 **PyTorch compatibility note:** CUDA-graph capture in the fast path is not reliable on `torch<=2.5.0` for this project (capture can fail with "operation not permitted when stream is capturing"). We validated `2.5.1+` as working and set that as the minimum supported version.
 
 ## Quick Start

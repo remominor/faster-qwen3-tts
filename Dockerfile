@@ -1,5 +1,7 @@
 FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
 
+LABEL org.opencontainers.image.source="https://github.com/remominor/faster-qwen3-tts"
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV MODEL_CACHE_SIZE=5
