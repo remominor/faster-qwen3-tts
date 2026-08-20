@@ -445,6 +445,13 @@ def _resolve_embedding_path(raw: str) -> Optional[str]:
 
 def resolve_voice(voice_name: str) -> dict:
     """Return voice config dict or fall back to default, else raise 400."""
+    # OpenAI-compatible clients commonly send the literal ``default`` when
+    # no named voice is selected. Resolve that alias before scanning uploaded
+    # files; otherwise a stale uploaded-voice entry can make ``default`` point
+    # at a nonexistent embedding filename.
+    if voice_name.strip().lower() == "default" and default_voice:
+        voice_name = default_voice
+
     if voice_name in voices:
         vcfg = dict(voices[voice_name])
 
